@@ -1,15 +1,19 @@
 import streamlit as st
-import pandas as pd
 import io
+import csv
 import re
 
+# ==========================================
 # 網頁版面設定
+# ==========================================
 st.set_page_config(page_title="💊 健保大數據自動整併中心", layout="wide")
 st.title("💊 健保藥品大數據：用量、價格與主檔自動整併系統")
-st.markdown("這是一個能永續使用的自動化工具。只需上傳最新檔案，系統會自動幫您合併成一張 **Master Excel 總表**！")
+st.markdown("這是一個採用 **「極速純 Python 引擎」** 的永續整併工具。不依賴肥大套件，完美相容所有雲端環境！")
 st.markdown("---")
 
+# ==========================================
 # 檔案上傳區塊
+# ==========================================
 col1, col2, col3 = st.columns(3)
 
 with col1:
@@ -24,64 +28,137 @@ with col3:
     st.subheader("💰 3. 最新健保價查詢檔")
     price_files = st.file_uploader("上傳 TXT 原始檔 (可多選)", type=['txt'], accept_multiple_files=True)
 
-# 簡易整併按鈕
+# ==========================================
+# 純 Python 解析與整併核心 (無 Pandas 依賴)
+# ==========================================
 if st.button("🚀 開始一鍵無腦融合", type="primary"):
     if not master_file or not volume_files or not price_files:
         st.error("⚠️ 請確保三大類的檔案皆已上傳！")
     else:
-        with st.spinner('⚙️ 系統正在處理中...'):
+        with st.spinner('⚙️ 引擎正在全速處理中...'):
             try:
-                # 1. 讀取主檔 (Master)
-                df_master = pd.read_csv(master_file)
-                df_master = df_master.rename(columns={df_master.columns[0]: '健保藥品代碼'})
+                # --- 1. 讀取與解析主檔 (Master) ---
+                master_bytes = master_file.getvalue()
+                master_text = master_bytes.decode('utf-8-sig', errors='ignore')
+                master_reader = csv.reader(io.StringIO(master_text))
                 
-                # 2. 處理用量檔 (Volumes)
-                df_vols_list = []
+                master_headers = next(master_reader, None)
+                if not master_headers:
+                    st.error("主檔格式有誤，請確認是否為 CSV。")
+                    st.stop()
+                
+                # 找出「藥品代號」在第幾個欄位
+                code_idx = -1
+                for idx, h in enumerate(master_headers):
+                    if '代號' in h or '代碼' in h or 'ID' in h.upper():
+                        code_idx = idx
+                        break
+                
+                if code_idx == -1:
+                    code_idx = 0  # 預設為第一個欄位
+                
+                # 重新命名該標題為「健保藥品代碼」
+                master_headers[code_idx] = "健保藥品代碼"
+                
+                # 載入主檔數據，以藥品代碼為 Key 去重
+                master_data = {}
+                for row in master_reader:
+                    if not row: continue
+                    key = row[code_idx].strip()
+                    if key and key not in master_data:
+                        master_data[key] = row
+
+                # --- 2. 處理用量檔 (Volumes) ---
+                # 用一個字典記錄：{藥品代碼: {年份: 總用量}}
+                volume_map = {}
+                years_found = set()
+                
                 for v_file in volume_files:
-                    df_v = pd.read_csv(v_file)
+                    # 辨識年份
                     year = "111年" if "111" in v_file.name else ("112年" if "112" in v_file.name else "113年")
-                    # 尋找代碼與用量欄位
-                    code_col = [c for c in df_v.columns if '代碼' in c or '代號' in c][0]
-                    vol_col = [c for c in df_v.columns if '量' in c or '合計' in c][0]
+                    years_found.add(year)
                     
-                    df_v_grouped = df_v.groupby(code_col)[vol_col].sum().reset_index()
-                    df_v_grouped.columns = ['健保藥品代碼', f'{year}醫令用量']
-                    df_vols_list.append(df_v_grouped)
-                
-                df_volume_merged = df_vols_list[0]
-                for i in range(1, len(df_vols_list)):
-                    df_volume_merged = pd.merge(df_volume_merged, df_vols_list[i], on='健保藥品代碼', how='outer')
-                
-                # 3. 解析價格
-                price_results = []
+                    v_text = v_file.getvalue().decode('utf-8-sig', errors='ignore')
+                    v_reader = csv.reader(io.StringIO(v_text))
+                    v_headers = next(v_reader, None)
+                    if not v_headers: continue
+                    
+                    # 定位代碼與用量欄位
+                    v_code_idx = -1
+                    v_val_idx = -1
+                    for idx, h in enumerate(v_headers):
+                        if '代碼' in h or '代號' in h:
+                            v_code_idx = idx
+                        if '量' in h or '合計' in h:
+                            v_val_idx = idx
+                    
+                    if v_code_idx == -1: v_code_idx = 0
+                    if v_val_idx == -1: v_val_idx = -1
+                    
+                    # 累加用量
+                    for row in v_reader:
+                        if not row or len(row) <= max(v_code_idx, v_val_idx): continue
+                        v_code = row[v_code_idx].strip()
+                        if not v_code: continue
+                        
+                        try:
+                            # 移除數值中的逗號並轉換為 float
+                            v_val = float(row[v_val_idx].replace(',', '').strip())
+                        except ValueError:
+                            v_val = 0.0
+                            
+                        if v_code not in volume_map:
+                            volume_map[v_code] = {}
+                        volume_map[v_code][year] = volume_map[v_code].get(year, 0.0) + v_val
+
+                # --- 3. 解析價格 TXT (純文字 FWF 解析) ---
+                price_map = {}
                 for p_file in price_files:
-                    text_stream = io.StringIO(p_file.getvalue().decode('utf-8', errors='ignore'))
-                    for line in text_stream:
+                    p_text = p_file.getvalue().decode('utf-8', errors='ignore')
+                    for line in p_text.splitlines():
                         if not line.strip(): continue
                         parts = [p.strip() for p in re.split(r'\s{3,}', line) if p.strip()]
                         if len(parts) < 8: continue
                         try:
-                            code = parts[0].split()[1] if len(parts[0].split()) > 1 else ""
-                            price = parts[1].split()[0] if len(parts[1].split()) > 0 else "0"
-                            price_results.append({'健保藥品代碼': code, '最新健保單價': float(price)})
+                            code_part = parts[0].split()
+                            price_part = parts[1].split()
+                            if len(code_part) > 1 and len(price_part) > 0:
+                                code = code_part[1].strip()
+                                price = float(price_part[0].strip())
+                                price_map[code] = price
                         except:
                             continue
+
+                # --- 4. 終極大融合 (Merge & Generate CSV) ---
+                sorted_years = sorted(list(years_found))
+                # 新增欄位標題
+                output_headers = master_headers + [f"{y}醫令用量" for y in sorted_years] + ["最新健保單價"]
                 
-                df_price = pd.DataFrame(price_results).drop_duplicates(subset=['健保藥品代碼'], keep='last')
+                output_rows = []
+                for code, row_data in master_data.items():
+                    # 補足用量
+                    vol_v_list = []
+                    for y in sorted_years:
+                        vol_v_list.append(str(volume_map.get(code, {}).get(y, 0.0)))
+                    # 補足價格
+                    price_v = str(price_map.get(code, 0.0))
+                    
+                    output_rows.append(row_data + vol_v_list + [price_v])
+
+                # 將結果寫入記憶體中的 CSV
+                output_stream = io.StringIO()
+                writer = csv.writer(output_stream)
+                writer.writerow(output_headers)
+                writer.writerows(output_rows)
                 
-                # 4. 合併
-                final_master = pd.merge(df_master, df_volume_merged, on='健保藥品代碼', how='left')
-                final_master = pd.merge(final_master, df_price, on='健保藥品代碼', how='left').fillna(0)
-                
-                # 5. 直接轉為 CSV 輸出 (完全不依賴 Excel 寫入引擎，零崩潰率！)
-                csv_data = final_master.to_csv(index=False).encode('utf-8-sig')
-                
-                st.success("🎉 合併成功！")
+                csv_bytes = output_stream.getvalue().encode('utf-8-sig')
+
+                st.success("🎉 太棒了！大數據合併已成功完成！")
                 st.download_button(
                     label="📥 下載健保大數據 Master 總表 (CSV 格式)",
-                    data=csv_data,
+                    data=csv_bytes,
                     file_name="健保藥物大數據_Master總表.csv",
                     mime="text/csv"
                 )
             except Exception as e:
-                st.error(f"發生錯誤：{str(e)}")
+                st.error(f"系統在融合過程中發生未知錯誤：{str(e)}")
